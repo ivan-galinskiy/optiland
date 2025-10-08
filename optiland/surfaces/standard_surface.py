@@ -12,16 +12,45 @@ Kramer Harrison, 2023
 
 from __future__ import annotations
 
+import math
+import os
+from dataclasses import dataclass
+from typing import Any, Protocol, runtime_checkable
+
 import optiland.backend as be
 from optiland.coatings import BaseCoating, FresnelCoating
 from optiland.geometries import BaseGeometry
 from optiland.interactions.base import BaseInteractionModel
 from optiland.interactions.refractive_reflective_model import RefractiveReflectiveModel
-from optiland.materials import BaseMaterial
+from optiland.materials import (
+    AbbeMaterial,
+    BaseMaterial,
+    IdealMaterial,
+    Material,
+    MaterialFile,
+)
 from optiland.physical_apertures import BaseAperture
-from optiland.physical_apertures.radial import configure_aperture
+from optiland.physical_apertures.radial import RadialAperture, configure_aperture
 from optiland.rays import BaseRays, ParaxialRays, RealRays
 from optiland.scatter import BaseBSDF
+
+
+@runtime_checkable
+class CurvedGeometry(Protocol):
+    radius: Any
+    k: Any
+
+
+@dataclass(frozen=True)
+class SurfaceSummary:
+    surface_type: str
+    radius: float | None
+    thickness: float
+    material: str | None
+    conic: float | None
+    semi_aperture: float | None
+    is_stop: bool
+    comment: str
 
 
 class Surface:
@@ -181,6 +210,100 @@ class Surface:
         """Sets the coating of the surface to a Fresnel coating."""
         self.coating = FresnelCoating(self.material_pre, self.material_post)
         self.interaction_model.coating = self.coating
+
+    @staticmethod
+    def _as_scalar(value: Any) -> float | None:
+        """Convert backend numeric types to float scalars."""
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            array = be.to_numpy(value)
+        except TypeError:
+            return None
+        if getattr(array, "size", 0) == 1:
+            scalar = array.item()
+            return float(scalar) if isinstance(scalar, (int, float)) else None
+        return None
+
+    def _material_label(self) -> str | None:
+        """Return a descriptive label for the post-surface material."""
+        if self.interaction_model.is_reflective:
+            return "Mirror"
+
+        material = self.material_post
+        match material:
+            case Material():
+                return material.name
+            case MaterialFile():
+                return os.path.basename(material.filename)
+            case IdealMaterial():
+                index_value = self._as_scalar(material.index)
+                if index_value is None:
+                    return None
+                return "Air" if math.isclose(index_value, 1.0, abs_tol=1e-9) else f"{index_value:.4f}"
+            case AbbeMaterial():
+                index_value = self._as_scalar(material.index)
+                if index_value is None:
+                    return None
+                abbe_value = material.abbe()
+                return f"{index_value:.4f}, {abbe_value:.2f}"
+            case _:
+                index_value = self._as_scalar(getattr(material, "index", None))
+                if index_value is not None:
+                    if math.isclose(index_value, 1.0, abs_tol=1e-9):
+                        return "Air"
+                    return f"{index_value:.4f}"
+                return material.__class__.__name__
+
+    def _summary(self) -> SurfaceSummary:
+        surface_type = str(self.geometry)
+        if self.is_stop:
+            surface_type = f"Stop - {surface_type}"
+
+        radius: float | None = None
+        conic: float | None = None
+        if isinstance(self.geometry, CurvedGeometry):
+            radius = self._as_scalar(self.geometry.radius)
+            conic = self._as_scalar(self.geometry.k)
+
+        semi_aperture: float | None = None
+        if isinstance(self.aperture, RadialAperture):
+            semi_aperture = self._as_scalar(self.aperture.r_max)
+        elif self.semi_aperture is not None:
+            semi_aperture = float(self.semi_aperture)
+
+        thickness_value = self._as_scalar(self.thickness)
+        thickness = thickness_value if thickness_value is not None else float(self.thickness)
+
+        return SurfaceSummary(
+            surface_type=surface_type,
+            radius=radius,
+            thickness=thickness,
+            material=self._material_label(),
+            conic=conic,
+            semi_aperture=semi_aperture,
+            is_stop=self.is_stop,
+            comment=self.comment,
+        )
+
+    def __repr__(self) -> str:
+        summary = self._summary()
+
+        def render(value: object) -> str:
+            if isinstance(value, str):
+                return repr(value)
+            if isinstance(value, bool):
+                return str(value)
+            if isinstance(value, (int, float)):
+                return "inf" if math.isinf(value) else f"{value:.6g}"
+            if value is None:
+                return "None"
+            return repr(value)
+
+        parts = ", ".join(f"{field}={render(getattr(summary, field))}" for field in summary.__dataclass_fields__)
+        return f"Surface({parts})"
 
     def _record(self, rays):
         """Records the ray information.
